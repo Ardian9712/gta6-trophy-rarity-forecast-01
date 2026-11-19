@@ -27,6 +27,7 @@ const SETTINGS = Object.freeze({
   individualDamping: 1.1,
   individualPriorPrecision: 8,
 });
+const FIRST_REFRESH_AT = Date.parse('2026-11-19T04:30:00Z');
 
 function bounded(value, low, high) {
   return value < low ? low : value > high ? high : value;
@@ -218,7 +219,7 @@ function countNoise(players, percent) {
   return 1 / stabilized + (roundingHalfWidth / stabilized) ** 2 / 3;
 }
 
-function buildModel(trophies, pages, release, target) {
+function buildModel(trophies, pages, release, target, checkpoint) {
   const latest = pages[pages.length - 1];
   const priorSlope = Math.log(SETTINGS.launchPlayersAfter / SETTINGS.launchPlayersBefore)
     / Math.log1p(SETTINGS.launchRefreshHours / SETTINGS.clockOffsetHours);
@@ -230,16 +231,28 @@ function buildModel(trophies, pages, release, target) {
       / (populationFit.information + populationPrecision), 0.2, 2.5);
   const populationSlopeSd = Math.max(0.12,
     Math.sqrt(1 / (populationFit.information + populationPrecision)));
+  // Only a complete case supplies its checkpoint. Historical calibration
+  // prefixes retain their original population path, including in multi-page cases.
+  const anticipateFirstRefresh = pages.length === 1
+    && checkpoint < FIRST_REFRESH_AT && target >= FIRST_REFRESH_AT;
+  const populationEpoch = anticipateFirstRefresh ? FIRST_REFRESH_AT : latest.epoch;
   const futureClock = Math.max(0,
-    releaseClock(target, release) - releaseClock(latest.epoch, release));
+    releaseClock(target, release) - releaseClock(populationEpoch, release));
   const transientClock = dampedDistance(futureClock, SETTINGS.populationDamping);
-  const playerLogGrowth = Math.max(0,
+  const continuationLogGrowth = Math.max(0,
     priorSlope * futureClock + (populationSlope - priorSlope) * transientClock);
+  const playerLogGrowth = anticipateFirstRefresh
+    ? Math.log(SETTINGS.launchPlayersAfter / latest.players) + continuationLogGrowth
+    : continuationLogGrowth;
   const elapsedHours = Math.max(0, (target - latest.epoch) / HOUR_MS);
+  // The documented count has no growth-estimation error at the refresh itself.
+  // Only growth after that anchor uses the existing uncertainty coefficients.
+  const populationUncertaintyHours = anticipateFirstRefresh
+    ? Math.max(0, (target - FIRST_REFRESH_AT) / HOUR_MS) : elapsedHours;
   const playerLogSd = Math.hypot(
     populationSlopeSd * futureClock,
     0.20 * (futureClock - transientClock),
-    0.16 * Math.sqrt(Math.min(4, elapsedHours / 4)),
+    0.16 * Math.sqrt(Math.min(4, populationUncertaintyHours / 4)),
   );
   const observedPopulationSlope = populationFit.information > 0.1
     ? Math.max(0.1, populationFit.slope) : priorSlope;
@@ -281,7 +294,10 @@ function buildModel(trophies, pages, release, target) {
   }
   return {
     latest, individual, tiers, playerLogGrowth, playerLogSd, elapsedHours,
-    projectedPlayers: latest.players * Math.exp(playerLogGrowth),
+    organicLogGrowth: anticipateFirstRefresh ? continuationLogGrowth : undefined,
+    projectedPlayers: anticipateFirstRefresh
+      ? SETTINGS.launchPlayersAfter * Math.exp(continuationLogGrowth)
+      : latest.players * Math.exp(playerLogGrowth),
   };
 }
 
@@ -301,11 +317,18 @@ function trophyDistribution(model, index) {
   const logGrowth = Math.max(0,
     Math.log(model.latest.players / page.players) + model.playerLogGrowth);
   const longRunElasticity = 0.85 * tier.elasticity;
-  const earnerLogGrowth = bounded(longRunElasticity * logGrowth
+  const spreadEarnerLogGrowth = bounded(longRunElasticity * logGrowth
     + (elasticity - longRunElasticity)
       * dampedDistance(logGrowth, SETTINGS.individualDamping), 0, 0.94 * logGrowth);
-  // This is an actual count/denominator forecast, then a logit distribution.
-  const projectedRate = bounded(rate * Math.exp(earnerLogGrowth - logGrowth), 0, 100);
+  // A refresh adds tracked players without multiplying the existing earners.
+  // Only organic growth after the refresh enters the median's count growth.
+  const organicLogGrowth = model.organicLogGrowth;
+  const earnerLogGrowth = organicLogGrowth === undefined ? spreadEarnerLogGrowth
+    : bounded(longRunElasticity * organicLogGrowth + (elasticity - longRunElasticity)
+      * dampedDistance(organicLogGrowth, SETTINGS.individualDamping),
+    0, 0.94 * organicLogGrowth);
+  // Keep pass 1's rate-sensitivity and count/population-ratio references for SD.
+  const projectedRate = bounded(rate * Math.exp(spreadEarnerLogGrowth - logGrowth), 0, 100);
   // Clamp the observed logit, then transport it by the count/denominator move.
   // Clamping the projected median instead would freeze every 0.01% trophy.
   const referenceRate = bounded(rate, 0.01, 99.99);
@@ -321,7 +344,7 @@ function trophyDistribution(model, index) {
   const probability = projectedRate / 100;
   const logitSensitivity = 1 / Math.max(0.12, 1 - probability);
   const sd = bounded(logitSensitivity * Math.hypot(
-    (1 - earnerLogGrowth / Math.max(1e-12, logGrowth)) * model.playerLogSd,
+    (1 - spreadEarnerLogGrowth / Math.max(1e-12, logGrowth)) * model.playerLogSd,
     elasticitySd * logGrowth, sparseCountSd, structuralSd,
   ), 0.25, 2.5);
   return { certainStart: false, censoredZero: rate === 0, mean, sd };
@@ -401,7 +424,8 @@ function historicalCalibration(trophies, pages, release) {
 function makeForecast(example) {
   const pages = collapsePages(example);
   const release = Date.parse(example.game.release_date);
-  const model = buildModel(example.trophies, pages, release, Date.parse(example.target));
+  const model = buildModel(example.trophies, pages, release,
+    Date.parse(example.target), Date.parse(example.at));
   const calibration = historicalCalibration(example.trophies, pages, release);
   return { trophies: example.trophies.map((trophy, index) => ({
     id: trophy.id, q: distributionQuantiles(trophyDistribution(model, index),
